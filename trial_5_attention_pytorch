@@ -21,8 +21,8 @@ OUTPUT_CSV = '/home/curleyd/GitHub/New/verses_with_high_error.csv'
 ###########################
 MAX_LENGTH = 50
 EMBEDDING_DIM = 128
-LATENT_DIM = 64
-EPOCHS = 100
+LATENT_DIM = 128
+EPOCHS = 10000
 BATCH_SIZE = 32
 VAL_SPLIT = 0.2
 LEARNING_RATE = 1e-4
@@ -140,17 +140,33 @@ def calculate_reconstruction_error(text, tokenizer, model, max_length):
     return error
 
 ###########################
+# Early Stopping for PyTorch
+###########################
+class EarlyStopping:
+    def __init__(self, patience=3, min_delta=0.0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_loss = float('inf')
+        self.counter = 0
+
+    def step(self, val_loss):
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0  # reset patience counter
+        else:
+            self.counter += 1  # no improvement
+        return self.counter >= self.patience  # stop if patience exhausted
+
+###########################
 # Main Function
 ###########################
 def main():
     df = load_csv_with_id_and_text(INPUT_CSV)
     print(f'Loaded {len(df)} rows from {INPUT_CSV}.')
 
-    # Tokenizer
     tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
     vocab_size = tokenizer.vocab_size
 
-    # Dataset and DataLoader
     texts = df['clean_text'].tolist()
     dataset = TextDataset(texts, tokenizer, MAX_LENGTH)
     train_size = int((1 - VAL_SPLIT) * len(dataset))
@@ -160,17 +176,17 @@ def main():
     train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=BATCH_SIZE)
 
-    # Model
     model = TransformerAutoencoder(vocab_size, MAX_LENGTH, EMBEDDING_DIM, LATENT_DIM).to(DEVICE)
-
-    # Loss and Optimizer
     criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    # Training Loop
+    early_stopping = EarlyStopping(patience=3)
+
+    # ✅ This loop must be indented inside `main()`
     for epoch in range(EPOCHS):
         model.train()
         epoch_loss = 0
+
         for batch in train_loader:
             inputs, targets = batch
             inputs, targets = inputs.to(DEVICE), targets.to(DEVICE)
@@ -181,11 +197,29 @@ def main():
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
             epoch_loss += loss.item()
 
-        print(f"Epoch {epoch+1}/{EPOCHS} - Loss: {epoch_loss/len(train_loader):.4f}")
+        # Validation Loss Calculation
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                inputs, targets = batch
+                inputs, targets = inputs.to(DEVICE), targets.to(DEVICE)
 
-    # Reconstruction Error for all texts
+                logits = model(inputs)
+                loss = criterion(logits.reshape(-1, vocab_size), targets.reshape(-1))
+                val_loss += loss.item()
+
+        val_loss /= len(val_loader)
+        print(f"Epoch {epoch+1}/{EPOCHS} - Train Loss: {epoch_loss/len(train_loader):.4f}, Val Loss: {val_loss:.4f}")
+
+        if early_stopping.step(val_loss):
+            print(f"Early stopping triggered at epoch {epoch+1}")
+            break
+
+    # After training completes, compute reconstruction errors
     model.eval()
     errors = []
     for text in tqdm(df['clean_text'], desc="Calculating reconstruction error"):
@@ -193,13 +227,10 @@ def main():
         errors.append(err)
 
     df['error'] = errors
-
-    # Top 10% by error
     num_to_select = int(len(df) * 0.10)
     top_df = df.nlargest(num_to_select, 'error')
     top_df['final_output'] = top_df['id'] + ' ' + top_df['original_text']
 
-    # Save
     print(f'\nTop {num_to_select} lines (10%) with highest reconstruction error:\n')
     print(top_df[['final_output', 'error']].to_string(index=False))
 
