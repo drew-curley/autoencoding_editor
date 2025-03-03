@@ -1,0 +1,174 @@
+import os
+import string
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.callbacks import EarlyStopping
+import keras_nlp
+
+###########################
+# File paths
+###########################
+INPUT_CSV = '/home/curleyd/GitHub/New/output.csv'
+OUTPUT_CSV = '/home/curleyd/GitHub/New/verses_with_high_error.csv'
+
+###########################
+# Hyperparameters
+###########################
+NUM_WORDS = 10000       # Only keep top 10k words
+MAX_LENGTH = 50         # Max tokens per line
+EMBEDDING_DIM = 128
+LATENT_DIM = 64         # Hidden size in Transformer
+EPOCHS = 100
+BATCH_SIZE = 32
+VAL_SPLIT = 0.2
+
+###########################
+# Text preprocessing
+###########################
+def preprocess_for_model(text):
+    """
+    Lowercase, remove punctuation, strip extra spaces.
+    This is for feeding into the model (not for final output).
+    """
+    text = text.lower()
+    text = text.translate(str.maketrans('', '', string.punctuation))
+    text = text.strip()
+    return text
+
+###########################
+# Load CSV with single column
+###########################
+def load_csv_with_id_and_text(csv_path):
+    df = pd.read_csv(csv_path, header=None, names=['raw'])
+    df['id'] = df['raw'].str[:8]
+    df['original_text'] = df['raw'].str[8:].str.lstrip()
+    df['clean_text'] = df['original_text'].apply(preprocess_for_model)
+    return df
+
+###########################
+# Build Transformer Autoencoder
+###########################
+def build_transformer_autoencoder(vocab_size, max_length, embedding_dim, latent_dim):
+    encoder_input = keras.layers.Input(shape=(max_length,), dtype="int32")
+
+    # Embedding layer
+    x = keras.layers.Embedding(vocab_size, embedding_dim, input_length=max_length)(encoder_input)
+
+    # Positional Encoding
+    x = keras_nlp.layers.PositionEmbedding(sequence_length=max_length, initializer="uniform")(x)
+
+    # Transformer Encoder
+    encoder_output = keras_nlp.layers.TransformerEncoder(
+        num_heads=4,
+        intermediate_dim=latent_dim,
+        dropout=0.1
+    )(x)
+
+    # Pool to get latent vector (average pooling over sequence dimension)
+    latent_vector = keras.layers.GlobalAveragePooling1D()(encoder_output)
+
+    # Decoder: Expand back to sequence form
+    x = keras.layers.Dense(max_length * embedding_dim)(latent_vector)
+    x = tf.reshape(x, (-1, max_length, embedding_dim))
+
+    # Add positional encoding again for decoder
+    x = keras_nlp.layers.PositionEmbedding(sequence_length=max_length, initializer="uniform")(x)
+
+    # Transformer Decoder (in this simplified autoencoder case, it's just mapping to itself)
+    decoder_output = keras_nlp.layers.TransformerDecoder(
+        num_heads=4,
+        intermediate_dim=latent_dim,
+        dropout=0.1
+    )(x, encoder_output)
+
+    # Final prediction layer (vocab-sized softmax)
+    decoder_output = keras.layers.TimeDistributed(
+        keras.layers.Dense(vocab_size, activation="softmax")
+    )(decoder_output)
+
+    autoencoder = keras.Model(encoder_input, decoder_output)
+    encoder = keras.Model(encoder_input, latent_vector)
+
+    return autoencoder, encoder
+
+###########################
+# Reconstruction Error
+###########################
+def calculate_reconstruction_error(text, tokenizer, autoencoder, max_length, vocab_size):
+    sequence = tokenizer.texts_to_sequences([text])
+    sequence = pad_sequences(sequence, maxlen=max_length, padding='post')
+    sequence = np.clip(sequence, 0, vocab_size - 1)
+
+    predicted_seq = autoencoder.predict(sequence, verbose=0)
+    predicted_seq = np.clip(predicted_seq, 1e-10, 1.0)
+
+    sequence_flat = sequence.flatten()
+    predicted_seq_flat = predicted_seq.reshape(-1, predicted_seq.shape[-1])
+
+    error = -np.sum(
+        np.log(predicted_seq_flat[
+            np.arange(sequence_flat.shape[0]),
+            sequence_flat
+        ])
+    )
+    return error
+
+###########################
+# Main Function
+###########################
+def main():
+    df = load_csv_with_id_and_text(INPUT_CSV)
+    print(f'Loaded {len(df)} rows from {INPUT_CSV}.')
+
+    texts_for_tokenizer = df['clean_text'].tolist()
+    tokenizer = Tokenizer(num_words=NUM_WORDS, oov_token="<OOV>")
+    tokenizer.fit_on_texts(texts_for_tokenizer)
+
+    sequences = tokenizer.texts_to_sequences(texts_for_tokenizer)
+    vocab_size = len(tokenizer.word_index) + 1
+
+    padded_sequences = pad_sequences(sequences, maxlen=MAX_LENGTH, padding='post')
+    x_train = np.array(padded_sequences)
+    y_train = keras.utils.to_categorical(x_train, num_classes=vocab_size)
+
+    autoencoder, encoder = build_transformer_autoencoder(vocab_size, MAX_LENGTH, EMBEDDING_DIM, LATENT_DIM)
+    autoencoder.compile(optimizer="adam", loss="categorical_crossentropy")
+    autoencoder.summary()
+
+    early_stopping = EarlyStopping(
+        monitor="val_loss", patience=3, restore_best_weights=True
+    )
+
+    autoencoder.fit(
+        x_train,
+        y_train,
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        validation_split=VAL_SPLIT,
+        callbacks=[early_stopping]
+    )
+
+    errors = []
+    for text in df['clean_text']:
+        err = calculate_reconstruction_error(text, tokenizer, autoencoder, MAX_LENGTH, vocab_size)
+        errors.append(err)
+
+    df['error'] = errors
+
+    num_to_select = int(len(df) * 0.10)
+    top_df = df.nlargest(num_to_select, 'error')
+
+    top_df['final_output'] = top_df['id'] + ' ' + top_df['original_text']
+
+    print(f'\nTop {num_to_select} lines (10%) with highest reconstruction error:\n')
+    print(top_df[['final_output', 'error']].to_string(index=False))
+
+    top_df[['final_output', 'error']].to_csv(OUTPUT_CSV, index=False)
+    print(f'\nResults saved to {OUTPUT_CSV}')
+
+if __name__ == "__main__":
+    main()
