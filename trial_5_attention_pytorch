@@ -1,0 +1,210 @@
+import os
+import string
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from transformers import BertTokenizer, BertModel
+from tqdm import tqdm
+
+###########################
+# File paths
+###########################
+INPUT_CSV = '/home/curleyd/GitHub/New/output.csv'
+OUTPUT_CSV = '/home/curleyd/GitHub/New/verses_with_high_error.csv'
+
+###########################
+# Hyperparameters
+###########################
+MAX_LENGTH = 50
+EMBEDDING_DIM = 128
+LATENT_DIM = 64
+EPOCHS = 100
+BATCH_SIZE = 32
+VAL_SPLIT = 0.2
+LEARNING_RATE = 1e-4
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+###########################
+# Text preprocessing
+###########################
+def preprocess_for_model(text):
+    text = text.lower()
+    text = text.translate(str.maketrans('', '', string.punctuation))
+    text = text.strip()
+    return text
+
+###########################
+# Load CSV with single column
+###########################
+def load_csv_with_id_and_text(csv_path):
+    df = pd.read_csv(csv_path, header=None, names=['raw'])
+    df['id'] = df['raw'].str[:8]
+    df['original_text'] = df['raw'].str[8:].str.lstrip()
+    df['clean_text'] = df['original_text'].apply(preprocess_for_model)
+    return df
+
+###########################
+# Dataset
+###########################
+class TextDataset(Dataset):
+    def __init__(self, texts, tokenizer, max_length):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.texts = texts
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        text = self.texts[idx]
+        encoding = self.tokenizer(
+            text,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt"
+        )
+        input_ids = encoding["input_ids"].squeeze(0)
+        return input_ids, input_ids  # input = target for autoencoder
+
+###########################
+# Transformer Autoencoder
+###########################
+class TransformerAutoencoder(nn.Module):
+    def __init__(self, vocab_size, max_length, embedding_dim, latent_dim):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embedding_dim, nhead=4, dim_feedforward=latent_dim
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=2)
+
+        self.latent_projection = nn.Linear(max_length * embedding_dim, latent_dim)
+
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=embedding_dim, nhead=4, dim_feedforward=latent_dim
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=2)
+
+        self.output_layer = nn.Linear(embedding_dim, vocab_size)
+
+    def forward(self, x):
+        embedded = self.embedding(x)  # (batch, seq_len, embed_dim)
+
+        # Encoder (transpose needed for Transformer API)
+        encoded = self.encoder(embedded.transpose(0, 1))  # (seq_len, batch, embed_dim)
+
+        # Flatten to latent vector
+        latent = encoded.transpose(0, 1).reshape(x.shape[0], -1)
+        latent = self.latent_projection(latent)
+
+        # Expand latent back to sequence format
+        repeated_latent = latent.unsqueeze(1).expand(-1, x.shape[1], -1)
+
+        # Decoder (rebuild original sequence)
+        decoded = self.decoder(repeated_latent.transpose(0, 1), encoded)  # (seq_len, batch, embed_dim)
+
+        # Final prediction (vocab size)
+        logits = self.output_layer(decoded).transpose(0, 1)  # (batch, seq_len, vocab_size)
+
+        return logits
+
+###########################
+# Reconstruction Error
+###########################
+def calculate_reconstruction_error(text, tokenizer, model, max_length):
+    encoding = tokenizer(
+        text,
+        padding="max_length",
+        truncation=True,
+        max_length=max_length,
+        return_tensors="pt"
+    )
+    input_ids = encoding["input_ids"].to(DEVICE)
+
+    with torch.no_grad():
+        logits = model(input_ids)
+
+    log_probs = F.log_softmax(logits, dim=-1)
+
+    target = input_ids.view(-1)
+    log_probs = log_probs.view(-1, log_probs.shape[-1])
+
+    error = -log_probs[torch.arange(len(target)), target].sum().item()
+    return error
+
+###########################
+# Main Function
+###########################
+def main():
+    df = load_csv_with_id_and_text(INPUT_CSV)
+    print(f'Loaded {len(df)} rows from {INPUT_CSV}.')
+
+    # Tokenizer
+    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+    vocab_size = tokenizer.vocab_size
+
+    # Dataset and DataLoader
+    texts = df['clean_text'].tolist()
+    dataset = TextDataset(texts, tokenizer, MAX_LENGTH)
+    train_size = int((1 - VAL_SPLIT) * len(dataset))
+    val_size = len(dataset) - train_size
+    train_set, val_set = torch.utils.data.random_split(dataset, [train_size, val_size])
+
+    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_set, batch_size=BATCH_SIZE)
+
+    # Model
+    model = TransformerAutoencoder(vocab_size, MAX_LENGTH, EMBEDDING_DIM, LATENT_DIM).to(DEVICE)
+
+    # Loss and Optimizer
+    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+    # Training Loop
+    for epoch in range(EPOCHS):
+        model.train()
+        epoch_loss = 0
+        for batch in train_loader:
+            inputs, targets = batch
+            inputs, targets = inputs.to(DEVICE), targets.to(DEVICE)
+
+            logits = model(inputs)
+            loss = criterion(logits.reshape(-1, vocab_size), targets.reshape(-1))
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+
+        print(f"Epoch {epoch+1}/{EPOCHS} - Loss: {epoch_loss/len(train_loader):.4f}")
+
+    # Reconstruction Error for all texts
+    model.eval()
+    errors = []
+    for text in tqdm(df['clean_text'], desc="Calculating reconstruction error"):
+        err = calculate_reconstruction_error(text, tokenizer, model, MAX_LENGTH)
+        errors.append(err)
+
+    df['error'] = errors
+
+    # Top 10% by error
+    num_to_select = int(len(df) * 0.10)
+    top_df = df.nlargest(num_to_select, 'error')
+    top_df['final_output'] = top_df['id'] + ' ' + top_df['original_text']
+
+    # Save
+    print(f'\nTop {num_to_select} lines (10%) with highest reconstruction error:\n')
+    print(top_df[['final_output', 'error']].to_string(index=False))
+
+    top_df[['final_output', 'error']].to_csv(OUTPUT_CSV, index=False)
+    print(f'\nResults saved to {OUTPUT_CSV}')
+
+if __name__ == "__main__":
+    main()
