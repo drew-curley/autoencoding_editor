@@ -28,6 +28,7 @@ BATCH_SIZE = 32
 VAL_SPLIT = 0.2
 LEARNING_RATE = 1e-4
 MASK_PROB = 0.3  # Probability of masking tokens
+ERROR_THRESHOLD = 0.1  # Threshold for flagging high-error verses (adjust as needed)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -100,9 +101,34 @@ class MaskedAutoencoder(nn.Module):
         return logits
 
 ###########################
-# Training Loop
+# Calculate Reconstruction Error
 ###########################
-def train_model():
+def calculate_reconstruction_error(model, tokenizer, text, max_length, device):
+    # Tokenize and prepare input (no masking for evaluation)
+    encoding = tokenizer(
+        text,
+        padding="max_length",
+        truncation=True,
+        max_length=max_length,
+        return_tensors="pt"
+    )
+    input_ids = encoding["input_ids"].to(device)
+    
+    # Get model prediction
+    model.eval()
+    with torch.no_grad():
+        logits = model(input_ids)
+        probs = F.softmax(logits, dim=-1)
+        predicted_ids = torch.argmax(probs, dim=-1)
+    
+    # Calculate error (mean absolute difference between input and predicted IDs)
+    error = torch.mean((input_ids != predicted_ids).float()).item()
+    return error
+
+###########################
+# Training and Evaluation Loop
+###########################
+def train_and_evaluate_model():
     df = load_csv_with_id_and_text(INPUT_CSV)
     print(f'Loaded {len(df)} rows from {INPUT_CSV}.')
     
@@ -121,6 +147,7 @@ def train_model():
     criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     
+    # Training
     for epoch in range(EPOCHS):
         model.train()
         train_loss = 0
@@ -152,5 +179,22 @@ def train_model():
     torch.save(model.state_dict(), "masked_autoencoder.pth")
     print("Training complete. Model saved.")
 
+    # Evaluation for Error Detection
+    print("Evaluating verses for reconstruction errors...")
+    high_error_verses = []
+    
+    for idx, row in tqdm(df.iterrows(), total=len(df)):
+        error = calculate_reconstruction_error(model, tokenizer, row['text'], MAX_LENGTH, DEVICE)
+        if error > ERROR_THRESHOLD:
+            high_error_verses.append({'id': row['id'], 'text': row['text'], 'error': error})
+    
+    # Save high-error verses to CSV
+    if high_error_verses:
+        error_df = pd.DataFrame(high_error_verses)
+        error_df.to_csv(OUTPUT_CSV, index=False)
+        print(f"Saved {len(high_error_verses)} verses with high errors to {OUTPUT_CSV}.")
+    else:
+        print("No verses exceeded the error threshold.")
+
 if __name__ == "__main__":
-    train_model()
+    train_and_evaluate_model()
