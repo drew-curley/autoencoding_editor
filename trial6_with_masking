@@ -1,0 +1,156 @@
+import os
+import string
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from transformers import BertTokenizer, BertModel
+from tqdm import tqdm
+import random
+
+###########################
+# File paths
+###########################
+INPUT_CSV = '/home/curleyd/GitHub/New/output.csv'
+OUTPUT_CSV = '/home/curleyd/GitHub/New/verses_with_high_error.csv'
+
+###########################
+# Hyperparameters
+###########################
+MAX_LENGTH = 50
+EMBEDDING_DIM = 128
+LATENT_DIM = 128
+EPOCHS = 10000
+BATCH_SIZE = 32
+VAL_SPLIT = 0.2
+LEARNING_RATE = 1e-4
+MASK_PROB = 0.3  # Probability of masking tokens
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+###########################
+# Load CSV with single column
+###########################
+def load_csv_with_id_and_text(csv_path):
+    df = pd.read_csv(csv_path, header=None, names=['raw'])
+    df['id'] = df['raw'].str[:8]
+    df['text'] = df['raw'].str[8:].str.lstrip()
+    return df
+
+###########################
+# Dataset with Masking
+###########################
+class MaskedTextDataset(Dataset):
+    def __init__(self, texts, tokenizer, max_length, mask_prob):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.texts = texts
+        self.mask_prob = mask_prob
+        self.mask_token_id = tokenizer.mask_token_id
+    
+    def __len__(self):
+        return len(self.texts)
+    
+    def __getitem__(self, idx):
+        text = self.texts[idx]
+        encoding = self.tokenizer(
+            text,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt"
+        )
+        input_ids = encoding["input_ids"].squeeze(0)
+        masked_input = input_ids.clone()
+        
+        # Apply random masking
+        mask = torch.rand(input_ids.shape) < self.mask_prob
+        masked_input[mask] = self.mask_token_id
+        
+        return masked_input, input_ids  # Input is masked, target is original
+
+###########################
+# Masked Autoencoder
+###########################
+class MaskedAutoencoder(nn.Module):
+    def __init__(self, vocab_size, max_length, embedding_dim, latent_dim):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embedding_dim, nhead=4, dim_feedforward=latent_dim
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        
+        self.decoder_layer = nn.TransformerDecoderLayer(
+            d_model=embedding_dim, nhead=4, dim_feedforward=latent_dim
+        )
+        self.decoder = nn.TransformerDecoder(self.decoder_layer, num_layers=2)
+        
+        self.output_layer = nn.Linear(embedding_dim, vocab_size)
+    
+    def forward(self, x):
+        embedded = self.embedding(x).transpose(0, 1)  # (seq_len, batch, embed_dim)
+        encoded = self.encoder(embedded)  # Encoder output
+        decoded = self.decoder(encoded, encoded)  # Decode using encoded representations
+        logits = self.output_layer(decoded).transpose(0, 1)  # Back to (batch, seq_len, vocab_size)
+        return logits
+
+###########################
+# Training Loop
+###########################
+def train_model():
+    df = load_csv_with_id_and_text(INPUT_CSV)
+    print(f'Loaded {len(df)} rows from {INPUT_CSV}.')
+    
+    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+    vocab_size = tokenizer.vocab_size
+    
+    dataset = MaskedTextDataset(df['text'].tolist(), tokenizer, MAX_LENGTH, MASK_PROB)
+    train_size = int((1 - VAL_SPLIT) * len(dataset))
+    val_size = len(dataset) - train_size
+    train_set, val_set = torch.utils.data.random_split(dataset, [train_size, val_size])
+    
+    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_set, batch_size=BATCH_SIZE)
+    
+    model = MaskedAutoencoder(vocab_size, MAX_LENGTH, EMBEDDING_DIM, LATENT_DIM).to(DEVICE)
+    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    
+    for epoch in range(EPOCHS):
+        model.train()
+        train_loss = 0
+        
+        for masked_input, target in train_loader:
+            masked_input, target = masked_input.to(DEVICE), target.to(DEVICE)
+            logits = model(masked_input)
+            loss = criterion(logits.view(-1, vocab_size), target.view(-1))
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
+        
+        print(f"Epoch {epoch+1}/{EPOCHS} - Loss: {train_loss/len(train_loader):.4f}")
+
+        if epoch % 10 == 0:
+            model.eval()
+            val_loss = 0
+            with torch.no_grad():
+                for masked_input, target in val_loader:
+                    masked_input, target = masked_input.to(DEVICE), target.to(DEVICE)
+                    logits = model(masked_input)
+                    loss = criterion(logits.view(-1, vocab_size), target.view(-1))
+                    val_loss += loss.item()
+            print(f"Validation Loss: {val_loss / len(val_loader):.4f}")
+    
+    torch.save(model.state_dict(), "masked_autoencoder.pth")
+    print("Training complete. Model saved.")
+
+if __name__ == "__main__":
+    train_model()
