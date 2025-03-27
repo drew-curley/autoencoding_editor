@@ -1,0 +1,304 @@
+import os
+import logging
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from transformers import BertTokenizer
+from tqdm import tqdm
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Hyperparameters and configuration
+config = {
+    'input_csv': '/home/curleyd/GitHub/content_pipeline/tiriki/output.csv',
+    'output_csv': '/home/curleyd/GitHub/content_pipeline/tiriki/verses_with_high_error.csv',
+    'max_length': 50,
+    'embedding_dim': 128,
+    'latent_dim': 128,
+    'epochs': 1000,
+    'batch_size': 32,
+    'val_split': 0.2,
+    'learning_rate': 1e-4,
+    'mask_prob': 0.3,
+    'error_threshold': 0.1,
+    'early_stopping_patience': 5,  # Defined explicitly
+    'device': torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    'min_train_delta': 1e-4,  # Minimum decrease in training loss to be considered improvement
+}
+
+### Load CSV with Single Column ###
+def load_csv_with_id_and_text(csv_path):
+    """
+    Load CSV and extract ID and text from each row.
+    
+    Args:
+        csv_path (str): Path to the input CSV file.
+    
+    Returns:
+        pd.DataFrame: DataFrame with 'id' and 'text' columns.
+    
+    Raises:
+        Exception: If CSV loading fails.
+    """
+    try:
+        df = pd.read_csv(csv_path, header=None, names=['raw'])
+        df['id'] = df['raw'].str[:8]
+        df['text'] = df['raw'].str[8:].str.lstrip()
+        return df
+    except Exception as e:
+        logging.error(f"Error loading CSV: {e}")
+        raise
+
+### Dataset with Masking ###
+class MaskedTextDataset(Dataset):
+    """
+    Dataset class for handling text with random masking.
+    
+    Args:
+        texts (list): List of text strings.
+        tokenizer: BERT tokenizer instance.
+        max_length (int): Maximum sequence length.
+        mask_prob (float): Probability of masking a token.
+    """
+    def __init__(self, texts, tokenizer, max_length, mask_prob):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.texts = texts
+        self.mask_prob = mask_prob
+        self.mask_token_id = tokenizer.mask_token_id
+    
+    def __len__(self):
+        return len(self.texts)
+    
+    def __getitem__(self, idx):
+        text = self.texts[idx]
+        encoding = self.tokenizer(
+            text,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt"
+        )
+        input_ids = encoding["input_ids"].squeeze(0)
+        masked_input = input_ids.clone()
+        
+        # Apply random masking
+        mask = torch.rand(input_ids.shape) < self.mask_prob
+        masked_input[mask] = self.mask_token_id
+        
+        return masked_input, input_ids  # Input is masked, target is original
+
+### Masked Autoencoder Model ###
+class MaskedAutoencoder(nn.Module):
+    """
+    Masked Autoencoder using Transformer encoder and decoder.
+    
+    Args:
+        vocab_size (int): Size of the vocabulary.
+        max_length (int): Maximum sequence length.
+        embedding_dim (int): Dimension of token embeddings.
+        latent_dim (int): Dimension of the feedforward network in Transformer.
+    """
+    def __init__(self, vocab_size, max_length, embedding_dim, latent_dim):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embedding_dim, nhead=4, dim_feedforward=latent_dim
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=embedding_dim, nhead=4, dim_feedforward=latent_dim
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=2)
+        
+        self.output_layer = nn.Linear(embedding_dim, vocab_size)
+    
+    def forward(self, x):
+        embedded = self.embedding(x).transpose(0, 1)  # (seq_len, batch, embed_dim)
+        encoded = self.encoder(embedded)
+        decoded = self.decoder(encoded, encoded)
+        logits = self.output_layer(decoded).transpose(0, 1)  # (batch, seq_len, vocab_size)
+        return logits
+
+### Calculate Reconstruction Error ###
+def calculate_reconstruction_error(model, tokenizer, text, max_length, device):
+    """
+    Calculate reconstruction error for a given text.
+    
+    Args:
+        model: Trained MaskedAutoencoder model.
+        tokenizer: BERT tokenizer instance.
+        text (str): Input text to evaluate.
+        max_length (int): Maximum sequence length.
+        device: PyTorch device (CPU/GPU).
+    
+    Returns:
+        float: Proportion of incorrectly predicted tokens.
+    """
+    encoding = tokenizer(
+        text,
+        padding="max_length",
+        truncation=True,
+        max_length=max_length,
+        return_tensors="pt"
+    )
+    input_ids = encoding["input_ids"].to(device)
+    
+    model.eval()
+    with torch.no_grad():
+        logits = model(input_ids)
+        probs = F.softmax(logits, dim=-1)
+        predicted_ids = torch.argmax(probs, dim=-1)
+    
+    error = torch.mean((input_ids != predicted_ids).float()).item()
+    return error
+
+### Training Function ###
+def train_model(model, train_loader, val_loader, criterion, optimizer, config):
+    """
+    Train the model with hybrid early stopping based on validation and training loss.
+    """
+    best_val_loss = float('inf')
+    best_train_loss = float('inf')
+    patience_counter = 0
+    device = config['device']
+    
+    for epoch in range(config['epochs']):
+        model.train()
+        train_loss = 0
+
+        for masked_input, target in tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['epochs']}"):
+            masked_input, target = masked_input.to(device), target.to(device)
+            logits = model(masked_input)
+            loss = criterion(logits.reshape(-1, config['vocab_size']), target.reshape(-1))
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item()
+
+        train_loss_avg = train_loss / len(train_loader)
+        logging.info(f"Epoch {epoch+1} - Train Loss: {train_loss_avg:.6f}")
+
+        # Evaluate on validation set
+        val_loss = evaluate_model(model, val_loader, criterion, config)
+        logging.info(f"Epoch {epoch+1} - Validation Loss: {val_loss:.6f}")
+
+        # Check for improvement
+        val_improved = val_loss < best_val_loss
+        train_improved = (best_train_loss - train_loss_avg) > config['min_train_delta']
+
+        if val_improved or train_improved:
+            if val_improved:
+                best_val_loss = val_loss
+                torch.save(model.state_dict(), "best_model.pth")
+                logging.info("🔼 New best validation model saved.")
+            if train_improved:
+                best_train_loss = train_loss_avg
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            logging.info(f"No improvement. Patience: {patience_counter}/{config['early_stopping_patience']}")
+
+        if patience_counter >= config['early_stopping_patience']:
+            logging.info("⛔ Early stopping triggered.")
+            break
+
+
+### Evaluation Function ###
+def evaluate_model(model, val_loader, criterion, config):
+    """
+    Evaluate the model on the validation set.
+    
+    Args:
+        model: MaskedAutoencoder model instance.
+        val_loader: DataLoader for validation data.
+        criterion: Loss function.
+        config (dict): Configuration dictionary with hyperparameters.
+    
+    Returns:
+        float: Average validation loss.
+    """
+    model.eval()
+    val_loss = 0
+    device = config['device']
+    
+    with torch.no_grad():
+        for masked_input, target in val_loader:
+            masked_input, target = masked_input.to(device), target.to(device)
+            logits = model(masked_input)
+            loss = criterion(logits.reshape(-1, config['vocab_size']), target.reshape(-1))
+            val_loss += loss.item()
+    
+    return val_loss / len(val_loader)
+
+### Error Detection Function ###
+def detect_errors(model, df, tokenizer, config):
+    """
+    Detect verses with high reconstruction errors and save them to CSV.
+    
+    Args:
+        model: Trained MaskedAutoencoder model.
+        df (pd.DataFrame): DataFrame with 'id' and 'text' columns.
+        tokenizer: BERT tokenizer instance.
+        config (dict): Configuration dictionary with hyperparameters.
+    """
+    high_error_verses = []
+    
+    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Evaluating verses"):
+        error = calculate_reconstruction_error(model, tokenizer, row['text'], config['max_length'], config['device'])
+        if error > config['error_threshold']:
+            high_error_verses.append({'id': row['id'], 'text': row['text'], 'error': error})
+    
+    if high_error_verses:
+        error_df = pd.DataFrame(high_error_verses)
+        error_df.to_csv(config['output_csv'], index=False)
+        logging.info(f"Saved {len(high_error_verses)} verses with high errors to {config['output_csv']}.")
+    else:
+        logging.info("No verses exceeded the error threshold.")
+
+### Main Function ###
+def main():
+    """Main execution function for training and evaluating the Masked Autoencoder."""
+    logging.info("🚀 Starting training and evaluation...")
+    
+    # Load data
+    df = load_csv_with_id_and_text(config['input_csv'])
+    logging.info(f"Loaded {len(df)} rows from {config['input_csv']}.")
+    
+    # Initialize tokenizer and add vocab size to config
+    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+    config['vocab_size'] = tokenizer.vocab_size
+    
+    # Prepare dataset and loaders
+    dataset = MaskedTextDataset(df['text'].tolist(), tokenizer, config['max_length'], config['mask_prob'])
+    train_size = int((1 - config['val_split']) * len(dataset))
+    val_size = len(dataset) - train_size
+    train_set, val_set = torch.utils.data.random_split(dataset, [train_size, val_size])
+    
+    train_loader = DataLoader(train_set, batch_size=config['batch_size'], shuffle=True)
+    val_loader = DataLoader(val_set, batch_size=config['batch_size'])
+    
+    # Initialize model, loss, and optimizer
+    model = MaskedAutoencoder(config['vocab_size'], config['max_length'], config['embedding_dim'], config['latent_dim']).to(config['device'])
+    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+    optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
+    
+    # Train and save the model
+    train_model(model, train_loader, val_loader, criterion, optimizer, config)
+    torch.save(model.state_dict(), "masked_autoencoder.pth")
+    logging.info("Training complete. Final model saved.")
+    
+    # Detect and save high-error verses
+    detect_errors(model, df, tokenizer, config)
+
+if __name__ == "__main__":
+    main()
