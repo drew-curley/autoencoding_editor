@@ -1,0 +1,194 @@
+import os
+import logging
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, random_split
+from transformers import BertTokenizer, AutoModelForSeq2SeqLM, AutoTokenizer
+from transformers import Trainer, TrainingArguments
+from datasets import Dataset
+from tqdm import tqdm
+import transformers
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Log transformers version
+logging.info(f"Using transformers version: {transformers.__version__}")
+
+# Configuration
+config = {
+    'bitext_csv': os.path.expanduser("/home/curleyd/GitHub/New/bitext.csv"),
+    'output_csv': os.path.expanduser("/home/curleyd/GitHub/New/anomalous_with_alternatives.csv"),
+    'zrl_col': 4,  # Zero-resource language (column 5, 0-based index)
+    'english_col': 5,  # English (column 6)
+    'zrl_lang_code': 'deu_Latn',  # Example NLLB code; adjust for your ZRL
+    'max_length': 50,
+    'embedding_dim': 128,
+    'latent_dim': 128,
+    'mae_epochs': 10,
+    'batch_size': 32,
+    'val_split': 0.2,
+    'learning_rate': 1e-4,
+    'mask_prob': 0.3,
+    'error_threshold': 0.15,
+    'early_stopping_patience': 5,
+    'translation_epochs': 3,
+    'translation_batch_size': 16,  # Note: overridden in TrainingArguments
+    'device': torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+}
+
+# Load bitexts.csv
+try:
+    df = pd.read_csv(config['bitext_csv'], header=None)
+    df['id'] = df.iloc[:, 0].astype(str)
+except FileNotFoundError:
+    logging.error(f"Could not find {config['bitext_csv']}")
+    exit(1)
+
+# Initialize BERT tokenizer for MAE
+try:
+    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+    config['vocab_size'] = tokenizer.vocab_size
+except Exception as e:
+    logging.error(f"Failed to load BERT tokenizer: {e}")
+    exit(1)
+
+# Dataset for MAE
+class MaskedTextDataset(Dataset):
+    def __init__(self, texts, tokenizer, max_length, mask_prob):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.texts = texts
+        self.mask_prob = mask_prob
+        self.mask_token_id = tokenizer.mask_token_id
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        text = str(self.texts[idx])
+        encoding = self.tokenizer(
+            text, padding="max_length", truncation=True, max_length=self.max_length, return_tensors="pt"
+        )
+        input_ids = encoding["input_ids"].squeeze(0)
+        masked_input = input_ids.clone()
+        mask = torch.rand(input_ids.shape) < self.mask_prob
+        masked_input[mask] = self.mask_token_id
+        return masked_input, input_ids
+
+    def __getitems__(self, indices):
+        return [self[idx] for idx in indices]
+
+# Masked Autoencoder model
+class MaskedAutoencoder(nn.Module):
+    def __init__(self, vocab_size, max_length, embedding_dim, latent_dim):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=embedding_dim, nhead=4, dim_feedforward=latent_dim)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        decoder_layer = nn.TransformerDecoderLayer(d_model=embedding_dim, nhead=4, dim_feedforward=latent_dim)
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=2)
+        self.output_layer = nn.Linear(embedding_dim, vocabI apologize, but I notice that your message got cut off. It seems you wanted me to help adapt a script for fine-tuning the NLLB model, but the full script wasn't included. Based on what I can see, I'll provide guidance on how to modify the `fine_tune_nllb` function to use the undistilled `facebook/nllb-200-3.3B` model, as this seems to be a common request. If you have a different specific need or want me to work with the full script, please share it, and I’ll tailor the response accordingly!
+
+Assuming your script structure is similar to typical NLLB fine-tuning scripts, here’s how you can update the `fine_tune_nllb` function to use the undistilled `facebook/nllb-200-3.3B` model with appropriate settings:
+
+---
+
+### Adapted `fine_tune_nllb` Function
+```python
+def fine_tune_nllb(df, config):
+    try:
+        # Load the undistilled NLLB-200-3.3B model and tokenizer
+        model = AutoModelForSeq2SeqLM.from_pretrained("facebook/nllb-200-3.3B")
+        tokenizer = AutoTokenizer.from_pretrained("facebook/nllb-200-3.3B")
+        tokenizer.src_lang = "eng_Latn"  # English as source language
+        tokenizer.tgt_lang = config['zrl_lang_code']  # Target ZRL language (e.g., 'deu_Latn')
+    except Exception as e:
+        logging.error(f"Failed to load NLLB model: {e}")
+        exit(1)
+
+    # Prepare dataset
+    parallel_data = [
+        {"src": str(row[config['english_col']]), "tgt": str(row[config['zrl_col']])}
+        for _, row in df.iterrows()
+        if pd.notna(row[config['english_col']]) and pd.notna(row[config['zrl_col']])
+        and isinstance(row[config['english_col']], str) and isinstance(row[config['zrl_col']], str)
+        and row[config['english_col']].strip() and row[config['zrl_col']].strip()
+    ]
+    
+    if not parallel_data:
+        logging.error("No valid parallel data found for fine-tuning.")
+        exit(1)
+        
+    dataset = Dataset.from_list(parallel_data)
+    logging.info(f"Dataset size: {len(dataset)}")
+    logging.info(f"Dataset sample: {dataset[:2]}")
+
+    # Define tokenization function
+    def tokenize_function(examples):
+        model_inputs = tokenizer(
+            examples["src"],
+            text_target=examples["tgt"],
+            padding="max_length",
+            truncation=True,
+            max_length=config['max_length']
+        )
+        return model_inputs
+
+    # Test tokenization
+    test_batch = {"src": dataset[:2]["src"], "tgt": dataset[:2]["tgt"]}
+    try:
+        test_output = tokenize_function(test_batch)
+        logging.info("Tokenization test successful.")
+    except Exception as e:
+        logging.error(f"Tokenization test failed: {e}")
+        exit(1)
+
+    try:
+        tokenized_dataset = dataset.map(tokenize_function, batched=True)
+    except Exception as e:
+        logging.error(f"Failed to tokenize dataset: {e}")
+        exit(1)
+
+    # Split dataset into train and evaluation sets
+    train_size = int((1 - config['val_split']) * len(tokenized_dataset))
+    train_dataset = tokenized_dataset.select(range(train_size))
+    eval_dataset = tokenized_dataset.select(range(train_size, len(tokenized_dataset)))
+
+    # Define training arguments for the larger model
+    training_args = TrainingArguments(
+        output_dir="./nllb_results",
+        eval_strategy="epoch",
+        learning_rate=2e-5,
+        per_device_train_batch_size=1,  # Reduced for larger model
+        per_device_eval_batch_size=1,
+        gradient_accumulation_steps=16,  # Simulate larger batch size
+        num_train_epochs=config['translation_epochs'],
+        weight_decay=0.01,
+        save_strategy="epoch",
+        load_best_model_at_end=True,
+    )
+
+    # Initialize trainer
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+    )
+
+    # Fine-tune the model
+    try:
+        trainer.train()
+    except Exception as e:
+        logging.error(f"Failed to fine-tune NLLB: {e}")
+        exit(1)
+
+    # Save the fine-tuned model and tokenizer
+    model.save_pretrained("fine_tuned_nllb")
+    tokenizer.save_pretrained("fine_tuned_nllb")
+    return model, tokenizer
